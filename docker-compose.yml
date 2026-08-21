@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: pc_build_db
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: pc_build_db
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  api:
+    build: ./backend
+    container_name: pc_build_api
+    restart: always
+    ports:
+      - "8080:8000"
+    env_file:
+      - ./backend/.env
+    depends_on:
+      - db
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  worker:
+    build: ./backend
+    container_name: pc_build_worker
+    restart: always
+    env_file:
+      - ./backend/.env
+    depends_on:
+      - db
+    command: python worker_scraper.py
+
+volumes:
+  postgres_data:
