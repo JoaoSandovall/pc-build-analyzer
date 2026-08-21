@@ -1,41 +1,135 @@
-# 🖥️ PC Build Analyzer
+# PC Build Analyzer
 
-O **PC Build Analyzer** é uma plataforma distribuída que automatiza a análise de orçamentos de hardware. O sistema extrai dados de arquivos multimodais (PDFs e Imagens) via IA Generativa, categoriza os componentes e realiza web scraping assíncrono para buscar os menores preços de mercado em tempo real, gerando um dashboard de comparação de custo-benefício.
+Sistema que recebe o upload de um orçamento de build de PC (imagem ou PDF), extrai os itens automaticamente via IA, e compara cada peça com o preço atual de mercado em múltiplas lojas — sinalizando itens acima da média e mostrando a economia potencial do orçamento.
 
-## 🚀 O Problema e a Solução
-A montagem de computadores envolve a comparação exaustiva de orçamentos recebidos em diversos formatos (prints, PDFs, texto livre). O PC Build Analyzer elimina o trabalho manual:
-1. O usuário faz o upload do arquivo do orçamento direto para um bucket seguro (AWS S3) via *Presigned URLs*.
-2. A aplicação aciona uma LLM Multimodal (Google Gemini) para extrair a descrição, o preço e a loja de origem.
-3. A IA categoriza as peças (GPU, CPU, Placa-Mãe, etc.) padronizando os dados no PostgreSQL.
-4. Um Worker em background consome mensagens (AWS SQS) e faz o *scraping* em múltiplas lojas (Terabyte, Pichau, etc.), exibindo o veredito de custo-benefício (Justo, Acima da Média, Muito Acima).
+## Índice
 
-## 🛠️ Stack Tecnológica
-* **Backend:** Python, FastAPI, SQLAlchemy, Alembic, Pydantic
-* **Frontend:** React, Vite, Tailwind CSS v4
-* **Banco de Dados:** PostgreSQL
-* **Mensageria & Cloud:** AWS SQS (Dead-Letter Queues), AWS S3
-* **Inteligência Artificial:** Google Gemini 3.6 Flash (Vision/Multimodal)
-* **Scraping:** BeautifulSoup, Cloudscraper, ThreadPoolExecutor
+- [Funcionalidades](#funcionalidades)
+- [Arquitetura](#arquitetura)
+- [Stack tecnológica](#stack-tecnológica)
+- [Como rodar localmente](#como-rodar-localmente)
+- [Variáveis de ambiente](#variáveis-de-ambiente)
+- [Testes](#testes)
+- [CI](#ci)
+- [A história da migração de loja](#a-história-da-migração-de-loja)
+- [Roadmap](#roadmap)
 
-## 🧠 Destaques de Engenharia & Arquitetura
+## Funcionalidades
 
-Durante o desenvolvimento deste MVP, vários desafios reais de engenharia foram superados:
+- Cadastro e login com autenticação JWT, com rate limiting nas rotas de auth
+- Upload de orçamento (imagem/PDF) direto para o S3, via URL pré-assinada
+- Extração automática dos itens do orçamento por IA (nome, categoria, preço)
+- Correção manual de um item extraído, caso a IA erre a categoria ou descrição
+- Busca assíncrona de preço de mercado por item, em três lojas (Terabyte, Kabum, Pichau), com o melhor resultado entre elas sendo salvo
+- Comparação item a item: preço do orçamento vs. preço de mercado, com veredito (`JUSTO`, `ACIMA_DA_MEDIA`, `MUITO_ACIMA`, `SEM_DADOS`)
+- Histórico de orçamentos, com exclusão (cascade completo: orçamento → itens → preços de mercado)
 
-### 1. Arquitetura Orientada a Eventos (Decoupling)
-O scraping de e-commerces é inerentemente lento e instável. Fazer isso de forma síncrona na requisição do usuário causaria *timeouts*. A solução foi desacoplar a busca: a API envia uma mensagem para a fila **AWS SQS** e retorna imediatamente para o frontend. Um **Worker isolado** consome a fila e faz o trabalho pesado.
+## Arquitetura
 
-### 2. Tolerância a Falhas e Anti-Bot (WAF)
-Lojas como a *Kabum* utilizam proteções severas (PerimeterX/Cloudflare). O sistema utiliza `cloudscraper` para contornar bloqueios básicos, mas também adota resiliência arquitetural: o Worker realiza o scraping das lojas simultaneamente via **Concorrência (Multithreading)**. Se uma loja bloquear ativamente o robô com um Captcha invisível, o sistema absorve a falha graciosamente, registrando 0 resultados e salvando o menor preço das outras lojas operacionais.
+```
+[React] --> [FastAPI] --> [PostgreSQL]
+   |                           ^
+   v                           |
+[URL pré-assinada S3] --> [Bucket S3]
 
-### 3. "Regra de Ouro" em Similaridade de Hardware
-O uso de algoritmos clássicos de NLP (como Índice de Jaccard) gera "Falsos Positivos" em hardware (ex: dar match entre uma RTX 4060 e uma RTX 4070 por compartilharem muitas palavras). A heurística de busca foi refinada para exigir **correspondência exata de numerais acima de 3 dígitos**, eliminando cruzamentos incorretos de GPUs e CPUs.
+[FastAPI] --(enfileira job)--> [SQS] --(consome)--> [Worker de scraping]
+                                                            |
+                                                    [Terabyte / Kabum / Pichau]
+                                                            |
+                                                            v
+                                                      [PostgreSQL]
+```
 
-### 4. OCR Clássico vs. LLM Multimodal
-O escopo inicial previa AWS Textract e RegEx para capturar os preços. Contudo, percebeu-se que o *layout* de orçamentos variava infinitamente. A solução foi migrar para **Modelos de Visão Computacional (Gemini)**, que conseguem inferir a estrutura da tabela do orçamento visualmente e devolver um JSON estrito validado pelo Pydantic.
+O upload vai direto pro S3 (o backend só gera a URL pré-assinada, não recebe o arquivo). A extração dos itens via IA acontece na rota `/budgets/process`. A partir daí, cada item pode ter seu preço de mercado buscado individualmente: a rota `/find-price` enfileira um job no SQS, e um **worker separado** (processo próprio, `worker_scraper.py`) consome a fila, faz o scraping nas três lojas e grava o melhor preço encontrado no banco.
 
-## ⚙️ Como rodar o projeto localmente
+Essa separação entre API e worker existe porque scraping é lento e sujeito a falha (timeout, bloqueio anti-bot). Se fosse síncrono dentro da própria rota da API, uma loja fora do ar travaria a experiência do usuário. Desacoplado via fila, a API responde na hora (`202 Accepted`) e o resultado fica disponível assim que o worker processar.
 
-### 1. Banco de Dados e Fila
-Levante o banco de dados via Docker:
+## Stack tecnológica
+
+**Backend:** Python, FastAPI, Pydantic, SQLAlchemy, Alembic, `python-jose` (JWT), `pwdlib` (hash de senha), `slowapi` (rate limiting)
+**Scraping:** `cloudscraper` (contorna proteção Cloudflare/WAF), BeautifulSoup
+**Frontend:** React 19, Vite, Tailwind CSS
+**Banco de dados:** PostgreSQL
+**AWS:** S3, SQS
+**IA:** API de extração dos itens a partir do arquivo de orçamento
+**Infra local:** Docker Compose (banco de dados)
+**CI:** GitHub Actions (testes automatizados a cada push)
+**Testes:** Pytest / `unittest`
+
+## Como rodar localmente
+
+### 1. Banco de dados
 ```bash
-docker-compose up -d
+docker compose up -d db
+```
+
+### 2. Backend
+```bash
+cd backend
+python -m venv venv
+source venv/bin/activate   # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+
+cp .env.example .env
+# preencha o .env com seus valores (veja a seção abaixo)
+
+alembic upgrade head
+python -m uvicorn main:app --reload
+```
+A API sobe em `http://127.0.0.1:8000`, com documentação interativa em `http://127.0.0.1:8000/docs`.
+
+### 3. Worker de scraping (opcional, só necessário pra testar o `find-price`)
+```bash
+cd backend
+python worker_scraper.py
+```
+
+### 4. Frontend
+```bash
+cd frontend
+npm install
+cp .env.example .env
+npm run dev
+```
+
+## Variáveis de ambiente
+
+Veja `backend/.env.example` e `frontend/.env.example` para a lista completa com comentários. Resumo:
+
+| Variável | Onde | Descrição |
+|---|---|---|
+| `DATABASE_URL` | backend | Conexão com o PostgreSQL |
+| `SECRET_KEY` | backend | Chave de assinatura dos tokens JWT |
+| `FRONTEND_URL` | backend | Origem liberada no CORS |
+| `AWS_REGION`, `AWS_BUCKET_NAME` | backend | Bucket S3 dos orçamentos enviados |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | backend | Credenciais AWS (dispensável se usar IAM role) |
+| `SQS_QUEUE_URL` | backend | Fila de jobs de scraping |
+| `GEMINI_API_KEY` | backend | API de extração dos itens do orçamento |
+| `VITE_API_URL` | frontend | URL base da API |
+
+## Testes
+
+```bash
+cd backend
+python -m pytest tests/ -v
+```
+
+> **Nota:** use sempre `python -m pytest`, não só `pytest` — sem o `-m`, o Python não adiciona a pasta atual ao `sys.path`, e os testes falham ao importar `scraper`/`schemas`. Foi um erro real que apareceu no CI (veja o histórico de commits) até ser corrigido dessa forma.
+
+## CI
+
+O workflow em `.github/workflows/ci.yml` roda a suíte de testes a cada push, com variáveis de ambiente de teste (mockadas — não usa banco nem credenciais reais).
+
+## A história da migração de loja
+
+O scraper original mirava só a Kabum. Em produção, tanto a Kabum quanto a Pichau se mostraram bem mais agressivas contra scraping do que o esperado (bloqueio por WAF/Cloudflare), então o projeto pivotou pra Terabyte primeiro, que tinha proteção mais leve — o que permitiu validar toda a arquitetura (parsing, similaridade, tratamento de item esgotado) contra um alvo real e estável.
+
+Com o pipeline provado, o scraper foi generalizado e reforçado com `cloudscraper` para lidar com a proteção anti-bot, permitindo reativar Kabum e Pichau como fontes adicionais — hoje o worker consulta as três lojas e usa o melhor resultado entre elas.
+
+## Roadmap
+
+- [ ] Dockerfile do backend (empacotar API e worker)
+- [ ] Atualizar `tests/test_scraper.py` para a nova assinatura do scraper genérico multi-loja (os testes atuais ainda apontam para a versão anterior, só-Terabyte, e precisam de fixtures novas)
+- [ ] Validar a dead-letter queue do SQS com uma falha real (não só simulada)
+- [ ] Decidir entre worker como processo de longa duração (atual) ou migrar para Lambda com trigger SQS
+- [ ] Limpeza do objeto no S3 quando um orçamento é deletado (hoje o registro some do banco, mas o arquivo permanece no bucket)
